@@ -424,7 +424,7 @@ export const QQOFFICIAL_EVENT_DESCRIPTIONS = {
   attempt: { zh: '发送前持久化的序号预留，不唤醒模型。', en: 'A sequence reservation persisted before sending; does not wake the model.' },
   removed: { zh: '平台接受撤回请求的存档回执，不唤醒模型。', en: 'An archived recall receipt; does not wake the model.' },
   acknowledged: { zh: '平台接受互动确认的存档回执，不唤醒模型。', en: 'An archived interaction acknowledgement; does not wake the model.' },
-  attachments: { zh: '重复消息的附件补充记录，只归档，不重复唤醒模型。', en: 'An archived attachment supplement for a duplicate message; does not wake the model.' },
+  attachments: { zh: '重复消息的附件补充记录：新引用随下一次正常唤醒投递，URL 刷新仅归档；不单独唤醒模型。', en: 'A durable attachment supplement: new references ride the next normal wakeup; URL refreshes are archive-only. Does not wake the model on its own.' },
 };
 
 export const QQOFFICIAL_CACHE_LABELS: Record<Language, [string, string]> = {

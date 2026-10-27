@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { EventEnvelope, ToolOutcome } from 'cortico/core/types.ts';
+import { WakeBus } from 'cortico/core/bus.ts';
 import { QQOfficialWorld } from '../src/world.ts';
 import { QQOFFICIAL_DEFAULTS, QQOFFICIAL_SECRET } from '../src/config.ts';
 import { TestHost, context, httpServer, json, SECRET, signedHeaders } from './helpers.ts';
@@ -24,15 +25,15 @@ async function start() {
   await world.start(host);
   callback = `http://${world.webUi().lamps![0].hint}`;
 }
-async function incoming(id: string, data: Record<string, unknown> = {}) {
-  const body = JSON.stringify({ op: 0, t: 'GROUP_AT_MESSAGE_CREATE', id: `event-${id}`, d: { id, group_openid: 'group', content: id, ...data } });
+async function incoming(id: string, data: Record<string, unknown> = {}, eventType = 'GROUP_AT_MESSAGE_CREATE') {
+  const body = JSON.stringify({ op: 0, t: eventType, id: `event-${id}`, d: { id, group_openid: 'group', content: id, ...data } });
   return fetch(callback, { method: 'POST', body, headers: signedHeaders(body) });
 }
 async function tool(name: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<string | ToolOutcome> {
   return world.tools().find(t => t.name === `qqofficial_${name}`)!.handler(args, { role: 'test', log: host.log, signal });
 }
 async function history() { return JSON.parse(await tool('history', { messagesOnly: true, limit: 100 }) as string) as EventEnvelope[]; }
-async function refs(id: string) { return (await history()).find(e => e.meta?.messageId === id)!.meta!.attachmentRefs as Array<Record<string, any>>; }
+async function refs(id: string) { return ((await history()).find(e => e.meta?.messageId === id)!.meta!.attachmentRefs ?? []) as Array<Record<string, any>>; }
 async function cached(id: string) { await vi.waitFor(async () => expect((await refs(id)).every(r => r.cacheStatus === 'cached')).toBe(true)); }
 async function read(args: Record<string, unknown>, signal?: AbortSignal) { return await tool('read_attachment', args, signal) as ToolOutcome; }
 function bytes(out: ToolOutcome) {
@@ -77,12 +78,59 @@ describe('durable attachment recovery', () => {
     expect(bytes(await read({ attachmentId: ref.attachmentId }))).toEqual(png);
     expect((host.store.get(original.cursor)!.meta!.data as any).attachments).toBeUndefined();
     expect(((await history())[0].meta!.data as any).attachments).toEqual([picture()]);
-    expect(host.pushes.filter(p => p.options?.deliver)).toHaveLength(1);
+    expect(host.pushes.filter(p => p.options?.deliver && p.options.trigger !== 'piggyback')).toHaveLength(1);
     const supplements = host.pushes.filter(p => p.event.type === 'qqofficial.attachments');
     expect(supplements).toHaveLength(1);
-    expect(supplements[0].options?.deliver).toBe(false);
+    expect(supplements[0].options).toMatchObject({ deliver: true, trigger: 'piggyback' });
     await incoming('enriched', { attachments: [picture()] });
     expect(host.pushes.filter(p => p.event.type === 'qqofficial.attachments')).toHaveLength(1);
+  });
+
+  it('queues only new references for the next normal wakeup and archives URL refreshes silently', async () => {
+    ctx.value.cfg.imageCacheTtlMs = 0;
+    // A normal event delivers immediately, so a wrongly scheduled supplement would also wake.
+    const bus = new WakeBus({ quietGapMs: 0, minBatchAgeMs: 0, maxBatchAgeMs: 0, maxBatchSize: 1 });
+    const append = host.pushEvent.bind(host);
+    vi.spyOn(host, 'pushEvent').mockImplementation(async (event, options) => {
+      const saved = await append(event, options);
+      if (options?.deliver) bus.push({ event: saved }, options);
+      return saved;
+    });
+    await incoming('piggyback');
+    expect(bus.takeIfReady()?.map(item => item.event?.type)).toEqual(['qqofficial.message']);
+    await incoming('piggyback', { attachments: [picture()] });
+    const [first] = await refs('piggyback');
+    expect(bus.pending()).toBe(1);
+    expect(bus.pendingImmediate()).toBe(0);
+    expect(bus.takeIfReady()).toBeNull();
+    await incoming('piggyback', { attachments: [picture('one', { url: picture().url + '?rkey=new' })] });
+    expect(host.pushes.at(-1)?.options?.deliver).toBe(false);
+    expect(bus.pending()).toBe(1);
+    await incoming('piggyback', { attachments: [picture(), picture('two')] });
+    const all = await refs('piggyback');
+    expect(bus.pending()).toBe(2);
+    expect(bus.takeIfReady()).toBeNull();
+    await incoming('can-you-see-it');
+    const batch = bus.takeIfReady()!.map(item => item.event!);
+    expect(batch.map(event => event.type)).toEqual(['qqofficial.attachments', 'qqofficial.attachments', 'qqofficial.message']);
+    const notices = batch.slice(0, 2).map(event => JSON.parse(event.text.slice(event.text.indexOf('\n') + 1)));
+    expect(notices.map(notice => notice.attachmentRefs.map((ref: any) => ref.attachmentId))).toEqual([[first.attachmentId], [all[1].attachmentId]]);
+    expect(notices[0]).toMatchObject({ messageCursor: first.cursor, messageId: 'piggyback' });
+    expect(notices.every(notice => !('entries' in notice))).toBe(true);
+    expect(batch[0].meta!.entries).toHaveLength(1);
+    expect(batch[1].meta!.entries).toHaveLength(2);
+  });
+
+  it('merges channel event variants for one message while retaining the first event type and separating targets', async () => {
+    await incoming('channel-message', { channel_id: 'channel' }, 'AT_MESSAGE_CREATE');
+    await incoming('channel-message', { channel_id: 'channel', attachments: [picture()] }, 'MESSAGE_CREATE');
+    await incoming('channel-message', { channel_id: 'other-channel' }, 'MESSAGE_CREATE');
+    const events = await history();
+    expect(events).toHaveLength(2);
+    expect(events[0].meta).toMatchObject({ eventType: 'AT_MESSAGE_CREATE', target: { kind: 'channel', id: 'channel' } });
+    expect(events[0].meta!.attachmentRefs).toHaveLength(1);
+    expect(events[1].meta).toMatchObject({ eventType: 'MESSAGE_CREATE', target: { kind: 'channel', id: 'other-channel' } });
+    expect(events[1].meta).not.toHaveProperty('attachmentRefs');
   });
 
   it('never drops a saved image on 27 sparse duplicates or repeated delayed reads', async () => {
@@ -185,6 +233,36 @@ describe('durable attachment recovery', () => {
     expect(downloads).toHaveLength(1);
   });
 
+  it.each(['reader', 'prefetch'] as const)('retries for an uncancelled %s that joined a cancelled user download', async joiner => {
+    ctx.value.cfg.imageCacheTtlMs = 0;
+    await incoming('cancel-owner', { attachments: [picture()] });
+    const [ref] = await refs('cancel-owner');
+    // Keep the owner download alive after its waiter cancels, as a network request can be.
+    const gate = new Promise<void>(resolve => { releaseDownload = resolve; });
+    const fetch = vi.spyOn(media, 'readAttachment').mockImplementationOnce(async (_url, options) => {
+      await gate;
+      options.signal.throwIfAborted();
+      throw new Error('Owner must have been cancelled');
+    });
+    const starts = vi.spyOn(world as any, 'downloadAttachment');
+    const controller = new AbortController();
+    const first = read({ attachmentId: ref.attachmentId }, controller.signal);
+    await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
+    let second: Promise<ToolOutcome> | undefined;
+    if (joiner === 'reader') second = read({ attachmentId: ref.attachmentId });
+    else {
+      ctx.value.cfg.imageCacheTtlMs = QQOFFICIAL_DEFAULTS.imageCacheTtlMs;
+      await incoming('cancel-owner', { attachments: [picture()] });
+    }
+    controller.abort();
+    expect(JSON.parse((await first).text).code).toBe('ATTACHMENT_READ_CANCELLED');
+    await vi.waitFor(() => expect(starts).toHaveBeenCalledTimes(2));
+    releaseDownload!();
+    if (second) expect(bytes(await second)).toEqual(png);
+    else { await cached('cancel-owner'); expect(bytes(await read({ attachmentId: ref.attachmentId }))).toEqual(png); }
+    expect(fetch).toHaveBeenCalledTimes(2);
+  });
+
   it('retries a refreshed duplicate URL when the previous download is still failing', async () => {
     downloadGate = new Promise(resolve => { releaseDownload = resolve; });
     await incoming('refreshed', { attachments: [picture('one', { url: picture().url + '?rkey=expired' })] });
@@ -202,7 +280,7 @@ describe('durable attachment recovery', () => {
     const gate = new Promise<void>(resolve => { releaseDownload = resolve; });
     const fetch = vi.spyOn(media, 'readAttachment').mockImplementationOnce(async () => {
       await gate;
-      throw new Error('Attachment exceeds maxMediaBytes');
+      throw new media.AttachmentDownloadError('TOO_LARGE', 'Image exceeds the prefetch limit');
     });
     await incoming('large', { attachments: [picture()] });
     await vi.waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
@@ -217,6 +295,25 @@ describe('durable attachment recovery', () => {
 });
 
 describe('attachment diagnostics and cache limits', () => {
+  it('keeps tool schemas compatible with providers that reject top-level combinators', () => {
+    for (const tool of world.tools()) {
+      expect(tool.parameters).toMatchObject({ type: 'object' });
+      for (const key of ['anyOf', 'oneOf', 'allOf']) expect(tool.parameters).not.toHaveProperty(key);
+    }
+    expect(world.tools().find(t => t.name === 'qqofficial_read_attachment')!.parameters.required).toEqual([]);
+  });
+
+  it('omits empty reference lists and fills missing quoted positions without sparse array nulls', async () => {
+    await incoming('plain');
+    expect((await history())[0].meta).not.toHaveProperty('attachmentRefs');
+    await incoming('plain', { msg_elements: [{}, {}, { msg_elements: [{}, { attachments: [picture()] }] }] });
+    const data = (await history())[0].meta!.data as any;
+    expect(data.msg_elements).toEqual([{}, {}, { msg_elements: [{}, { attachments: [picture()] }] }]);
+    const [ref] = await refs('plain');
+    expect(ref.quotedPath).toEqual([2, 1]);
+    expect(bytes(await read({ cursor: ref.cursor, index: 0, quotedPath: [2, 1] }))).toEqual(png);
+  });
+
   it('distinguishes cursor, source, event type, account, reference, quote and index errors', async () => {
     await incoming('diagnostics', { attachments: [picture()] });
     const [ref] = await refs('diagnostics');
@@ -270,6 +367,21 @@ describe('attachment diagnostics and cache limits', () => {
     const result = await read({ attachmentId: ref.attachmentId });
     expect(result.failed).toBe(true);
     expect(JSON.parse(result.text).code).toBe('ATTACHMENT_TOO_LARGE');
+  });
+
+  it.each([
+    { error: new media.AttachmentDownloadError('URL_REJECTED', 'Rejected by URL policy'), code: 'ATTACHMENT_URL_REJECTED' },
+    { error: new media.AttachmentDownloadError('TOO_LARGE', 'Size limit reached'), code: 'ATTACHMENT_TOO_LARGE' },
+    { error: new media.AttachmentDownloadError('HTTP_ERROR', 'Remote token expired', 403), code: 'ATTACHMENT_DOWNLOAD_FAILED', httpStatus: 403 },
+    { error: new Error('outside maxMediaBytes Attachment HTTP 403'), code: 'ATTACHMENT_DOWNLOAD_FAILED' },
+  ])('uses typed transport failures for $code instead of parsing error text', async ({ error, code, httpStatus }) => {
+    ctx.value.cfg.imageCacheTtlMs = 0;
+    await incoming('typed-error', { attachments: [picture()] });
+    const [ref] = await refs('typed-error');
+    vi.spyOn(media, 'readAttachment').mockRejectedValueOnce(error);
+    const result = JSON.parse((await read({ attachmentId: ref.attachmentId })).text);
+    expect(result.code).toBe(code);
+    expect(result.httpStatus).toBe(httpStatus);
   });
 
   it('isolates cached images and stable references after changing AppID', async () => {

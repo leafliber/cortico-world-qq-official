@@ -16,9 +16,8 @@ export function qqOfficialTools(language: ModelLanguage, execute: (action: QQOff
   const t = QQOFFICIAL_MODEL_TEXT[language];
   const define = (action: QQOfficialAction, name: string, properties: Record<string, unknown>, required: string[], tags: ToolDef['tags']): ToolDef => ({
     name: `qqofficial_${name}`, description: t[action], tags,
-    parameters: { type: 'object', properties, required, additionalProperties: false,
-      ...(action === 'read' ? { anyOf: [{ required: ['attachmentId'] }, { required: ['cursor', 'index'] }] } : {}),
-    },
+    // Some providers reject top-level combinators. Locator alternatives are checked at runtime.
+    parameters: { type: 'object', properties, required, additionalProperties: false },
     handler: async (args, ctx) => {
       try { return await execute(action, args, ctx.signal); }
       catch (error) {

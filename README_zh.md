@@ -85,7 +85,9 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 | `channel` | `channel_id` |
 | `dms` | 该频道私信的私有 `guild_id` |
 
-消息按 AppID、目标和消息 ID 去重，启动时从 World 存档重建消息与附件索引。同一消息后到的附件会通过 `qqofficial.attachments` 补充记录持久保存，保留原 cursor、已有附件与附件序号，不重复唤醒 Persona；补充记录保存失败时，Webhook 返回 503 供重试。其他事件有事件 ID 时按事件类型与事件 ID 去重，最多保留一万条近期标识。WebSocket 在当前 World 实例内重连时使用最后已保存的序号恢复；进程重启后创建新的网关会话。
+消息按 AppID、目标和消息 ID 去重，启动时从 World 存档重建消息与附件索引。频道中同一消息的 `AT_MESSAGE_CREATE` 与 `MESSAGE_CREATE` 会有意合并，保留先到的 eventType。同一消息后到的附件会通过 `qqofficial.attachments` 补充记录持久保存，保留原 cursor、已有附件与附件序号。新增 attachmentId 时，用 `trigger: piggyback` 将精简引用摘要入队：不单独唤醒 Persona、不刷新批处理计时器，随下一批正常唤醒一起投递；只有 URL/rkey 刷新时仍仅归档。补充记录保存失败时，Webhook 返回 503 供重试。其他事件有事件 ID 时按事件类型与事件 ID 去重，最多保留一万条近期标识。WebSocket 在当前 World 实例内重连时使用最后已保存的序号恢复；进程重启后创建新的网关会话。
+
+消息与附件索引目前仍在内存保留全量存档，包括没有附件的消息；内存占用和启动工作量会随历史增长。限制近期消息索引并按需查询旧存档属于后续工作，暂不直接淘汰索引，以免旧附件引用失效。
 
 发送序号预留 `qqofficial.attempt` 以及平台回执 `qqofficial.sent`、`qqofficial.removed`、`qqofficial.acknowledged` 均以 `deliver: false` 存档，因此不会再次唤醒 Persona。发送记录包含请求和平台响应；平台接受请求不代表收件人已读。HTTP 401 会触发一次刷新凭证后的重试。明确的限流最多重试两次，单次等待不超过五秒。自动降级仅处理明确拒绝：回复依据过期后改为主动发送、Markdown 权限不足后改为纯文本。内容审核拒绝、权限或额度不足不会被绕过。超时、HTTP 5xx 或响应缺少消息 ID 时保留“发送结果未知”，不自动重发。
 
@@ -110,11 +112,13 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 
 附件读取只接受 `qq.com`、`qq.com.cn`、`qpic.cn`、`ugcimg.cn` 及其子域的 HTTPS 地址，每次重定向重新校验，下载请求不携带机器人认证头。Core 按当前模型能力决定是否传递对应 MIME 类型；仅有 URL 和元数据不会被视为已经看见或听见附件。
 
-附件定位优先使用事件或 `qqofficial_history` 的 `meta.attachmentRefs` 中的 `attachmentId`（`qqa:` 开头），读取时单独传入该字段。引用绑定当前 AppID、会话和消息，在事件存档保留期间可跨重启使用。也可继续传入消息的 `cursor` 和从 0 开始的 `index`：`quotedIndex=0` 选择 `msg_elements[0]`，`quotedPath=[0,1]` 选择 `msg_elements[0].msg_elements[1]`；二者互斥。历史中的发送回执和通知不是可读取附件的消息，可用 `messagesOnly=true` 排除。history 返回补全后的附件视图，原始存档事件保持不变；仅归档的附件补充记录不单独出现在该工具结果中。
+附件定位优先使用事件或 `qqofficial_history` 的 `meta.attachmentRefs` 中的 `attachmentId`（`qqa:` 开头），读取时单独传入该字段。引用绑定当前 AppID、会话和消息，在事件存档保留期间可跨重启使用。也可继续传入消息的 `cursor` 和从 0 开始的 `index`：`quotedIndex=0` 选择 `msg_elements[0]`，`quotedPath=[0,1]` 选择 `msg_elements[0].msg_elements[1]`；二者互斥。历史中的发送回执和通知不是可读取附件的消息，可用 `messagesOnly=true` 排除。history 返回补全后的附件视图，原始存档事件保持不变；附件补充记录不单独出现在该工具结果中，没有附件的消息省略 `attachmentRefs`。
 
-收到图片元数据后会后台预取 PNG、JPEG、GIF、WebP、BMP 图片到部署的 `dataDir/qqofficial/image-cache/`，不阻塞事件保存和 Webhook 确认。默认保留 24 小时、整个部署最多 256 MiB，单图不超过 `maxMediaBytes` 与 30 MiB 的较小值；最多两个预取并发、256 个待处理项。缓存按最早保存时间淘汰，启动、访问和运行期间每分钟清理过期数据；设 `imageCacheTtlMs=0` 或 `imageCacheMaxBytes=0` 可关闭。缓存不会自动投递原图到模型，仍需调用读取工具；支持图片的模型才能看到其内容。引用与缓存都支持重启恢复，读取优先用缓存，缓存失效或损坏后重新下载。后台预取失败不丢弃消息或附件定位信息。
+收到图片元数据后会后台预取 PNG、JPEG、GIF、WebP、BMP 图片到部署的 `dataDir/qqofficial/image-cache/`，不阻塞事件保存和 Webhook 确认。默认保留 24 小时、整个部署最多 256 MiB，并限制为 10,000 张图片，单图不超过 `maxMediaBytes` 与 30 MiB 的较小值；最多两个预取并发、256 个待处理项。缓存按最早保存时间淘汰，启动、访问和运行期间每分钟清理过期数据，无变化时不重写索引。已有索引超过 4 MiB 读取上限时，本次运行停用缓存并保留磁盘文件。设 `imageCacheTtlMs=0` 或 `imageCacheMaxBytes=0` 可关闭。缓存不会自动投递原图到模型，仍需调用读取工具；支持图片的模型才能看到其内容。引用与缓存都支持重启恢复，读取优先用缓存，缓存失效或损坏后重新下载。后台预取失败不丢弃消息或附件定位信息。取消一次读取不会使共享下载的其他读取或预取失败，未取消的调用方会重新发起下载。
 
 交接摘要可保留 `attachmentId`，需要时重新读取图片。临时缓存过期且 QQ URL 已失效时，仍需用户重新上传。工具读取成功后产生的 Core `log:` 附件由宿主自己的附件保留策略管理，不受此预取缓存的 TTL 控制。本扩展不修改 Core/Persona 的上下文压缩策略。
+
+[Issue #1](https://github.com/leafliber/cortico-world-qq-official/issues/1) 继续保留实测验收，其中包括 QQ 重复投递时附件 ID 或 URL 中的 `fileid` 是否稳定。URL 身份判定忽略会轮换的 `rkey`，保留 `fileid` 等内容选择参数；若附件身份和内容选择参数都变化，同一图片可能新增一个引用。此时保留两个候选，不覆盖已有图片。
 
 读取失败返回结构化 `code`、`message`，并在适用时返回 `available` 附件列表或 `httpStatus`。可据此区分 `MESSAGE_CURSOR_NOT_FOUND`、`MESSAGE_EVENT_TYPE_MISMATCH`、`MESSAGE_ACCOUNT_MISMATCH`、`ATTACHMENT_REFERENCE_NOT_FOUND`、`QUOTED_MESSAGE_NOT_FOUND`、`ATTACHMENT_INDEX_NOT_FOUND` 与 `ATTACHMENT_DOWNLOAD_FAILED`，避免把定位错误误当作链接过期。
 

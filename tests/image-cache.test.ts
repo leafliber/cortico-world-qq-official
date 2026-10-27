@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, mkdir, readdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { ImageCache, type ImageCachePolicy } from '../src/image-cache.ts';
+import { ImageCache, MAX_IMAGE_CACHE_ENTRIES, type ImageCachePolicy } from '../src/image-cache.ts';
 
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 const id = (n: number) => `qqa:${String(n).padStart(40, '0')}`;
@@ -20,6 +20,53 @@ beforeEach(async () => {
 afterEach(async () => { await cache.flush(); await rm(root, { recursive: true, force: true }); vi.restoreAllMocks(); });
 
 describe('temporary image persistence', () => {
+  it('does not rewrite an unchanged index on periodic pruning or restart', async () => {
+    await cache.put(id(1), png, 'image/png');
+    const original = await stat(join(dir, 'index.json'));
+    await cache.prune(); await cache.prune();
+    cache = new ImageCache(root, () => policy); await cache.init();
+    const current = await stat(join(dir, 'index.json'));
+    expect(current.ino).toBe(original.ino);
+    expect(current.mtimeMs).toBe(original.mtimeMs);
+  });
+
+  it('bounds the number of small images on load and write, keeping the index reloadable', async () => {
+    policy.maxBytes = 1024 * 1024 * 1024;
+    await cache.put(id(1), png, 'image/png');
+    const entry = JSON.parse(await readFile(join(dir, 'index.json'), 'utf8'))[id(1)];
+    const count = MAX_IMAGE_CACHE_ENTRIES + 1;
+    // Missing data files are checked lazily; retain real bytes at the eviction boundary.
+    await writeFile(join(dir, id(count).slice(4) + '.bin'), png);
+    await writeFile(join(dir, 'index.json'), JSON.stringify(Object.fromEntries(Array.from({ length: count }, (_, i) =>
+      [id(i + 1), { ...entry, savedAt: entry.savedAt - count + i }]))));
+    cache = new ImageCache(root, () => policy); await cache.init();
+    let index = JSON.parse(await readFile(join(dir, 'index.json'), 'utf8'));
+    expect(Object.keys(index)).toHaveLength(MAX_IMAGE_CACHE_ENTRIES);
+    expect(index).not.toHaveProperty(id(1));
+    expect(await readdir(dir)).not.toContain(id(1).slice(4) + '.bin');
+    await cache.put(id(count + 1), png, 'image/png');
+    // Replacing an existing entry does not consume another slot.
+    await cache.put(id(count + 1), png, 'image/png');
+    index = JSON.parse(await readFile(join(dir, 'index.json'), 'utf8'));
+    expect(Object.keys(index)).toHaveLength(MAX_IMAGE_CACHE_ENTRIES);
+    expect(index).not.toHaveProperty(id(2));
+    expect(index).toHaveProperty(id(3));
+    expect((await stat(join(dir, 'index.json'))).size).toBeLessThan(4 * 1024 * 1024);
+    cache = new ImageCache(root, () => policy); await cache.init();
+    expect((await cache.get(id(count)))?.bytes).toEqual(png);
+    expect((await cache.get(id(count + 1)))?.bytes).toEqual(png);
+  });
+
+  it('leaves an oversized index and its image files intact instead of deleting them as orphans', async () => {
+    await cache.put(id(1), png, 'image/png');
+    const index = ' '.repeat(4 * 1024 * 1024) + await readFile(join(dir, 'index.json'), 'utf8');
+    await writeFile(join(dir, 'index.json'), index);
+    cache = new ImageCache(root, () => policy);
+    await expect(cache.init()).rejects.toThrow('Oversized image cache index');
+    expect(await readFile(join(dir, 'index.json'), 'utf8')).toBe(index);
+    expect(await readFile(join(dir, id(1).slice(4) + '.bin'))).toEqual(png);
+  });
+
   it('loads image bytes after restart and physically removes expired files when pruning', async () => {
     await cache.put(id(1), png, 'image/png');
     cache = new ImageCache(root, () => policy); await cache.init();

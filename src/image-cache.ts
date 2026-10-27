@@ -5,6 +5,9 @@ import { ATTACHMENT_ID } from './attachments.ts';
 
 interface CachedImage { mime: string; size: number; savedAt: number; digest: string; }
 export interface ImageCachePolicy { ttlMs: number; maxBytes: number; maxFileBytes: number; }
+// A byte budget alone permits too many tiny images. Normalized entries stay well below 4 MiB.
+export const MAX_IMAGE_CACHE_ENTRIES = 10000;
+const MAX_INDEX_BYTES = 4 * 1024 * 1024;
 
 /** Only ordinary raster images are prefetched/cached; MIME headers alone are not sufficient. */
 export function imageMime(bytes: Uint8Array): string | undefined {
@@ -21,6 +24,7 @@ export function imageMime(bytes: Uint8Array): string | undefined {
 export class ImageCache {
   private dir?: string;
   private entries: Record<string, CachedImage> = {};
+  private dirty = false;
   private pending = Promise.resolve<unknown>(undefined);
   constructor(dataDir: string, private readonly policy: () => ImageCachePolicy) {
     if (dataDir) this.dir = join(dataDir, 'qqofficial', 'image-cache');
@@ -38,25 +42,42 @@ export class ImageCache {
     try { await writeFile(temp, bytes, { mode: 0o600 }); await rename(temp, path); }
     finally { await rm(temp, { force: true }); }
   }
-  private async save() { if (this.dir) await this.atomic(join(this.dir, 'index.json'), JSON.stringify(this.entries)); }
-  private async remove(id: string) { await rm(this.file(id), { force: true }); delete this.entries[id]; }
+  private async save() {
+    if (!this.dir || !this.dirty) return;
+    await this.atomic(join(this.dir, 'index.json'), JSON.stringify(this.entries));
+    this.dirty = false;
+  }
+  private async remove(id: string) {
+    await rm(this.file(id), { force: true });
+    if (this.entries[id]) { delete this.entries[id]; this.dirty = true; }
+  }
 
   async init(): Promise<void> {
     if (!this.dir) return;
     await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const file = join(this.dir, 'index.json');
+    const size = await stat(file).then(info => info.size, error => {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+      throw error;
+    });
+    // Do not turn a load limit into a destructive orphan sweep. The World disables this
+    // cache for the run if an older/foreign index is too large, leaving its files intact.
+    if (size > MAX_INDEX_BYTES) throw new Error('Oversized image cache index');
     try {
-      const file = join(this.dir, 'index.json');
-      if ((await stat(file)).size > 4 * 1024 * 1024) throw new Error('Oversized image cache index');
       const value: unknown = JSON.parse(await readFile(file, 'utf8'));
       if (value && typeof value === 'object' && !Array.isArray(value)) {
         for (const [id, entry] of Object.entries(value)) {
           const e = entry as CachedImage;
           if (ATTACHMENT_ID.test(id) && e && /^[a-f0-9]{64}$/.test(e.digest) && /^image\/(png|jpeg|gif|webp|bmp)$/.test(e.mime)
-            && Number.isSafeInteger(e.size) && e.size > 0 && Number.isFinite(e.savedAt) && e.savedAt <= Date.now()) this.entries[id] = e;
+            && Number.isSafeInteger(e.size) && e.size > 0 && Number.isSafeInteger(e.savedAt) && e.savedAt >= 0 && e.savedAt <= Date.now()) {
+            this.entries[id] = { mime: e.mime, size: e.size, savedAt: e.savedAt, digest: e.digest };
+          }
         }
       }
+      this.dirty = JSON.stringify(value) !== JSON.stringify(this.entries);
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') this.entries = {};
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;
+      this.entries = {}; this.dirty = true;
     }
     // A crash between the data rename and index commit may leave an unreferenced file.
     for (const name of await readdir(this.dir)) {
@@ -73,9 +94,10 @@ export class ImageCache {
       if (!this.enabled || Date.now() - e.savedAt >= policy.ttlMs || e.size > policy.maxFileBytes) await this.remove(id);
     }
     let size = Object.values(this.entries).reduce((sum, e) => sum + e.size, 0);
+    let count = Object.keys(this.entries).length;
     for (const [id, e] of Object.entries(this.entries).sort((a, b) => a[1].savedAt - b[1].savedAt)) {
-      if (size <= policy.maxBytes) break;
-      await this.remove(id); size -= e.size;
+      if (size <= policy.maxBytes && count <= MAX_IMAGE_CACHE_ENTRIES) break;
+      await this.remove(id); size -= e.size; count--;
     }
   }
   prune(): Promise<void> { return this.serial(async () => { if (this.dir) { await this.trim(); await this.save(); } }); }
@@ -108,17 +130,20 @@ export class ImageCache {
       await this.trim();
       // Make space before writing, so the byte budget also bounds the temporary disk footprint.
       let size = Object.entries(this.entries).reduce((sum, [key, e]) => sum + (key === id ? 0 : e.size), 0);
+      let count = Object.keys(this.entries).length - (this.entries[id] ? 1 : 0);
       for (const [key, e] of Object.entries(this.entries).sort((a, b) => a[1].savedAt - b[1].savedAt)) {
-        if (size + bytes.length <= p.maxBytes) break;
-        if (key !== id) { await this.remove(key); size -= e.size; }
+        if (size + bytes.length <= p.maxBytes && count < MAX_IMAGE_CACHE_ENTRIES) break;
+        if (key !== id) { await this.remove(key); size -= e.size; count--; }
       }
       if (this.entries[id]) await this.remove(id);
       try {
         await this.atomic(this.file(id), bytes);
         this.entries[id] = { mime, size: bytes.length, savedAt: Date.now(), digest: createHash('sha256').update(bytes).digest('hex') };
+        this.dirty = true;
         await this.save();
       } catch (error) {
         delete this.entries[id];
+        this.dirty = true;
         await rm(this.file(id), { force: true }).catch(() => undefined);
         throw error;
       }

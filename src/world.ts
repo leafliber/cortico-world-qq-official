@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import { basename } from 'node:path';
 import type { Language } from 'cortico/core/language.ts';
-import type { EventEnvelope, OutputTap, ToolDef, ToolOutcome, World, WorldWebUiDecl, WorldHost } from 'cortico/core/types.ts';
+import type { EventEnvelope, OutputTap, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl, WorldHost } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { WorldContext } from 'cortico/world.ts';
 import { coerceGroupValues, getByPath, setByPath } from 'cortico/core/config-schema.ts';
@@ -10,7 +10,7 @@ import { QQOfficialApiError, QQOfficialClient, QQOFFICIAL_SANDBOX_URL } from './
 import { QQOFFICIAL_ID, QQOFFICIAL_SECRET, qqOfficialConfigGroup, validateConfig, type QQOfficialConfigSection } from './config.ts';
 import { QQOfficialGateway, type QQOfficialConnectionState } from './gateway.ts';
 import { QQOFFICIAL_MODEL_TEXT, type ModelLanguage } from './model-text.ts';
-import { readAttachment } from './media.ts';
+import { AttachmentDownloadError, readAttachment } from './media.ts';
 import { normalize } from './normalize.ts';
 import { integer, object, remoteUrl, route, string, target, targetKey, type JsonObject, type QQOfficialDispatch, type QQOfficialTarget } from './protocol.ts';
 import { qqOfficialText } from './strings.ts';
@@ -78,7 +78,7 @@ export class QQOfficialWorld implements World {
   private imageCacheTimer?: ReturnType<typeof setInterval>;
   private imageQueue = new Map<string, AttachmentEntry>();
   private imageWorkers = new Set<Promise<void>>();
-  private attachmentDownloads = new Map<string, { promise: Promise<DownloadedAttachment>; prefetch: boolean; url: unknown }>();
+  private attachmentDownloads = new Map<string, { promise: Promise<DownloadedAttachment>; prefetch: boolean; url: unknown; signal: AbortSignal }>();
 
   constructor(private readonly options: QQOfficialWorldOptions) {
     this.binding = new QQOfficialBinding(options.context.cfg.timeoutMs, options.endpoints?.bindingUrl);
@@ -244,10 +244,14 @@ export class QQOfficialWorld implements World {
         if (previous) {
           const entries = this.attachments.merge(previous.target, previous.messageId, incoming.data, previous.entries);
           if (JSON.stringify(entries) !== JSON.stringify(previous.entries)) {
+            const known = new Set(previous.entries.map(entry => entry.attachmentId));
+            const added = entries.filter(entry => !known.has(entry.attachmentId));
             // Commit before updating the in-memory union, so a failed append can be retried.
+            // Only new references ride the next wakeup; full descriptors remain in archive metadata.
             const supplement = await this.push('attachments', previous.target, {
-              messageCursor: previous.cursor, messageId: previous.messageId, entries,
-            });
+              messageCursor: previous.cursor, messageId: previous.messageId,
+              attachmentRefs: added.map(entry => attachmentSummary(entry, previous.cursor)),
+            }, added.length > 0, { entries }, 'piggyback');
             this.attachments.observe(supplement);
           }
           this.prefetchImages(previous.entries);
@@ -273,14 +277,14 @@ export class QQOfficialWorld implements World {
   private sender(value?: QQOfficialTarget): string { return value ? `${this.id}.${targetKey(value)}` : this.id; }
 
   private async push(kind: 'message' | 'notice' | 'sent' | 'attempt' | 'removed' | 'acknowledged' | 'attachments', destination: QQOfficialTarget | undefined,
-    data: JsonObject, deliver = false, extra: JsonObject = {}): Promise<EventEnvelope> {
+    data: JsonObject, deliver = false, extra: JsonObject = {}, trigger: TriggerMode = 'debounce'): Promise<EventEnvelope> {
     if (!this.host) throw new Error('World is not running');
     const event = await this.host.pushEvent({
       type: `${this.id}.${kind}`, source: this.id, origin: 'external', ts: nowIso(this.options.context.timezone),
       senderKey: this.sender(destination), ...(kind === 'sent' ? { tags: ['speak'] as const } : {}),
       text: `${this.text[kind]}\n${JSON.stringify(data)}`,
       meta: { ...data, ...extra, target: destination, appId: this.appId },
-    }, { deliver, trigger: 'debounce' });
+    }, { deliver, trigger });
     this.sessions.observe(event);
     return event;
   }
@@ -317,7 +321,8 @@ export class QQOfficialWorld implements World {
     if (active) return active.promise.catch(error => {
       const refreshed = active.url !== entry.attachment.url;
       const largerRead = !prefetch && active.prefetch && error instanceof AttachmentError && error.code === 'ATTACHMENT_TOO_LARGE';
-      if (!signal.aborted && (refreshed || largerRead)) return this.downloadAttachment(entry, signal, prefetch);
+      const ownerCancelled = active.signal.aborted && !signal.aborted;
+      if (!signal.aborted && (refreshed || largerRead || ownerCancelled)) return this.downloadAttachment(entry, signal, prefetch);
       throw error;
     });
     const task = (async () => {
@@ -336,13 +341,13 @@ export class QQOfficialWorld implements World {
         });
       } catch (error) {
         signal.throwIfAborted();
-        const reason = error instanceof Error ? error.message : '';
-        const status = /Attachment HTTP (\d+)/.exec(reason)?.[1];
-        const code = /outside|Invalid URL/.test(reason) ? 'ATTACHMENT_URL_REJECTED' : /maxMediaBytes/.test(reason) ? 'ATTACHMENT_TOO_LARGE' : 'ATTACHMENT_DOWNLOAD_FAILED';
+        const failure = error instanceof AttachmentDownloadError ? error : undefined;
+        const status = failure?.httpStatus;
+        const code = failure?.code === 'URL_REJECTED' ? 'ATTACHMENT_URL_REJECTED' : failure?.code === 'TOO_LARGE' ? 'ATTACHMENT_TOO_LARGE' : 'ATTACHMENT_DOWNLOAD_FAILED';
         throw new AttachmentError(code, status ? `Attachment download returned HTTP ${status}; the cached image is unavailable. Ask for a new upload if the URL has expired.`
           : code === 'ATTACHMENT_URL_REJECTED' ? 'Attachment URL is outside the permitted QQ CDN URLs.'
           : code === 'ATTACHMENT_TOO_LARGE' ? 'Attachment exceeds the configured download limit.' : 'Attachment download failed or timed out; retry the same attachmentId.',
-        { ...attachmentSummary(entry), cacheStatus: 'remote', ...(status ? { httpStatus: Number(status) } : {}) });
+        { ...attachmentSummary(entry), cacheStatus: 'remote', ...(status ? { httpStatus: status } : {}) });
       }
       const mime = imageMime(media.bytes);
       if (mime) {
@@ -353,7 +358,7 @@ export class QQOfficialWorld implements World {
       }
       return { ...media, source: 'remote' as const };
     })();
-    this.attachmentDownloads.set(entry.attachmentId, { promise: task, prefetch, url: entry.attachment.url });
+    this.attachmentDownloads.set(entry.attachmentId, { promise: task, prefetch, url: entry.attachment.url, signal });
     void task.finally(() => {
       if (this.attachmentDownloads.get(entry.attachmentId)?.promise === task) this.attachmentDownloads.delete(entry.attachmentId);
     }).catch(() => undefined);
@@ -436,7 +441,7 @@ export class QQOfficialWorld implements World {
         && (!args.messagesOnly || e.type === `${this.id}.message`)).slice(-limit).map(event => {
         const view = this.attachments.view(event);
         const message = this.attachments.at(event.cursor);
-        if (message) view.meta = { ...view.meta, attachmentRefs: message.entries.map(entry => ({
+        if (message?.entries.length) view.meta = { ...view.meta, attachmentRefs: message.entries.map(entry => ({
           ...attachmentSummary(entry, message.cursor), ...(this.imageCache?.status(entry.attachmentId) ?? { cacheStatus: 'remote' }),
         })) };
         return view;

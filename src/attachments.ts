@@ -141,12 +141,18 @@ export class AttachmentIndex {
       for (const index of entry.quotedPath) {
         if (!Array.isArray(container.msg_elements)) container.msg_elements = [];
         const elements = container.msg_elements as unknown[];
+        while (elements.length <= index) elements.push({});
         if (!record(elements[index])) elements[index] = {};
         container = elements[index] as JsonObject;
       }
       if (!Array.isArray(container.attachments)) container.attachments = [];
-      (container.attachments as unknown[])[entry.index] = structuredClone(entry.attachment);
+      const attachments = container.attachments as unknown[];
+      while (attachments.length <= entry.index) attachments.push({});
+      attachments[entry.index] = structuredClone(entry.attachment);
     }
-    return { ...event, meta: { ...event.meta, data, attachmentRefs: this.summaries(message) } };
+    const meta: JsonObject = { ...event.meta, data };
+    if (message.entries.length) meta.attachmentRefs = this.summaries(message);
+    else delete meta.attachmentRefs;
+    return { ...event, meta };
   }
 }

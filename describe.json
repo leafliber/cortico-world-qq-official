@@ -401,20 +401,7 @@
           }
         },
         "required": [],
-        "additionalProperties": false,
-        "anyOf": [
-          {
-            "required": [
-              "attachmentId"
-            ]
-          },
-          {
-            "required": [
-              "cursor",
-              "index"
-            ]
-          }
-        ]
+        "additionalProperties": false
       },
       "tags": [
         "read"
@@ -527,9 +514,10 @@
     },
     {
       "type": "qqofficial.attachments",
+      "trigger": "piggyback",
       "description": {
-        "zh": "重复消息的附件补充记录，只归档，不重复唤醒模型。",
-        "en": "An archived attachment supplement for a duplicate message; does not wake the model."
+        "zh": "重复消息的附件补充记录：新引用随下一次正常唤醒投递，URL 刷新仅归档；不单独唤醒模型。",
+        "en": "A durable attachment supplement: new references ride the next normal wakeup; URL refreshes are archive-only. Does not wake the model on its own."
       }
     }
   ],
