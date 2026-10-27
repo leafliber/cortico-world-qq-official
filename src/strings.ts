@@ -412,7 +412,7 @@ export const QQOFFICIAL_TOOL_SUMMARIES: Record<string, { zh: string; en: string 
   qqofficial_stream_message: { zh: '发送流式分片或自动转发下一轮回复正文。', en: 'Sends stream parts or forwards the next public reply.' },
   qqofficial_delete_message: { zh: '撤回机器人发送的消息。', en: 'Recalls messages sent by the bot.' },
   qqofficial_history: { zh: '读取当前机器人在 Core 中保存的事件历史。', en: 'Reads this bot’s event history stored by Core.' },
-  qqofficial_read_attachment: { zh: '读取已保存消息的 QQ CDN 附件。', en: 'Reads QQ CDN attachments from stored messages.' },
+  qqofficial_read_attachment: { zh: '按持久引用或消息游标读取附件，优先使用临时图片缓存。', en: 'Reads attachments by durable reference or message cursor, preferring cached images.' },
   qqofficial_ack_interaction: { zh: '确认平台互动事件。', en: 'Acknowledges platform interactions.' },
   qqofficial_list_targets: { zh: '查询已知 QQ 会话及主动接收状态。', en: 'Lists known QQ targets and proactive reception state.' },
 };
@@ -424,4 +424,19 @@ export const QQOFFICIAL_EVENT_DESCRIPTIONS = {
   attempt: { zh: '发送前持久化的序号预留，不唤醒模型。', en: 'A sequence reservation persisted before sending; does not wake the model.' },
   removed: { zh: '平台接受撤回请求的存档回执，不唤醒模型。', en: 'An archived recall receipt; does not wake the model.' },
   acknowledged: { zh: '平台接受互动确认的存档回执，不唤醒模型。', en: 'An archived interaction acknowledgement; does not wake the model.' },
+  attachments: { zh: '重复消息的附件补充记录，只归档，不重复唤醒模型。', en: 'An archived attachment supplement for a duplicate message; does not wake the model.' },
+};
+
+export const QQOFFICIAL_CACHE_LABELS: Record<Language, [string, string]> = {
+  zh: ['图片缓存保留时间（0 关闭）', '图片缓存总字节数（0 关闭）'],
+  'zh-Hant': ['圖片快取保留時間（0 關閉）', '圖片快取總位元組數（0 關閉）'],
+  en: ['Image cache lifetime (0 disables)', 'Image cache total bytes (0 disables)'],
+  ja: ['画像キャッシュ保持時間（0 で無効）', '画像キャッシュ合計バイト数（0 で無効）'],
+  ko: ['이미지 캐시 보관 시간 (0: 비활성화)', '이미지 캐시 총 바이트 수 (0: 비활성화)'],
+  fr: ['Durée du cache des images (0 désactive)', 'Taille totale du cache en octets (0 désactive)'],
+  de: ['Bildcache-Dauer (0 deaktiviert)', 'Bildcache-Gesamtgröße in Bytes (0 deaktiviert)'],
+  it: ['Durata cache immagini (0 disabilita)', 'Byte totali della cache immagini (0 disabilita)'],
+  'es-419': ['Duración de caché de imágenes (0 desactiva)', 'Bytes totales de caché de imágenes (0 desactiva)'],
+  'pt-BR': ['Duração do cache de imagens (0 desativa)', 'Total de bytes do cache de imagens (0 desativa)'],
+  ru: ['Срок хранения изображений (0 отключает)', 'Размер кэша изображений в байтах (0 отключает)'],
 };

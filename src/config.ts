@@ -1,6 +1,6 @@
 import type { Language } from 'cortico/core/language.ts';
 import type { ConfigGroup } from 'cortico/core/types.ts';
-import { qqOfficialText, QQOFFICIAL_DELIVERY_LABELS } from './strings.ts';
+import { qqOfficialText, QQOFFICIAL_DELIVERY_LABELS, QQOFFICIAL_CACHE_LABELS } from './strings.ts';
 import { integer } from './protocol.ts';
 
 export const QQOFFICIAL_ID = 'qqofficial';
@@ -17,6 +17,8 @@ export interface QQOfficialConfigSection {
   reconnectMs: number;
   maxReconnectMs: number;
   maxMediaBytes: number;
+  imageCacheTtlMs: number;
+  imageCacheMaxBytes: number;
   autoFallback: boolean;
   proactiveIntervalMs: number;
   streamIntervalMs: number;
@@ -31,6 +33,7 @@ export const QQOFFICIAL_DEFAULTS: QQOfficialConfigSection = {
   webhook: { host: '127.0.0.1', port: 6196, path: '/qqofficial/callback', maxBodyBytes: 1024 * 1024 },
   timeoutMs: 20000, reconnectMs: 1000, maxReconnectMs: 30000,
   maxMediaBytes: 100 * 1024 * 1024, modelLanguage: 'zh',
+  imageCacheTtlMs: 24 * 60 * 60 * 1000, imageCacheMaxBytes: 256 * 1024 * 1024,
   autoFallback: true, proactiveIntervalMs: 3000, streamIntervalMs: 500, streamIdleMs: 15000, ffmpegPath: 'ffmpeg',
 };
 
@@ -42,6 +45,8 @@ export function validateConfig(cfg: QQOfficialConfigSection): void {
   integer(cfg.reconnectMs, 'reconnectMs', 10, 300000);
   integer(cfg.maxReconnectMs, 'maxReconnectMs', cfg.reconnectMs, 300000);
   integer(cfg.maxMediaBytes, 'maxMediaBytes', 1, 100 * 1024 * 1024);
+  integer(cfg.imageCacheTtlMs, 'imageCacheTtlMs', 0, 30 * 24 * 60 * 60 * 1000);
+  integer(cfg.imageCacheMaxBytes, 'imageCacheMaxBytes', 0, 1024 * 1024 * 1024);
   if (typeof cfg.autoFallback !== 'boolean') throw new Error('Invalid autoFallback');
   integer(cfg.proactiveIntervalMs, 'proactiveIntervalMs', 0, 60000);
   integer(cfg.streamIntervalMs, 'streamIntervalMs', 0, 5000);
@@ -56,6 +61,7 @@ export function qqOfficialConfigGroup(language?: Language): ConfigGroup {
   const t = qqOfficialText(language);
   const k = 'worlds.qqofficial';
   const labels = QQOFFICIAL_DELIVERY_LABELS[language ?? 'zh'];
+  const cacheLabels = QQOFFICIAL_CACHE_LABELS[language ?? 'zh'];
   return {
     id: 'world:qqofficial', owner: 'world:qqofficial',
     schema: { type: 'object', title: t.settings, properties: {
@@ -71,6 +77,8 @@ export function qqOfficialConfigGroup(language?: Language): ConfigGroup {
       [`${k}.reconnectMs`]: { type: 'integer', title: t.reconnectMs, minimum: 10, maximum: 300000, 'x-suffix': 'ms', 'x-hot': false },
       [`${k}.maxReconnectMs`]: { type: 'integer', title: t.maxReconnectMs, minimum: 10, maximum: 300000, 'x-suffix': 'ms', 'x-hot': false },
       [`${k}.maxMediaBytes`]: { type: 'integer', title: t.maxMediaBytes, minimum: 1, maximum: 100 * 1024 * 1024, 'x-hot': true },
+      [`${k}.imageCacheTtlMs`]: { type: 'integer', title: cacheLabels[0], minimum: 0, maximum: 30 * 24 * 60 * 60 * 1000, 'x-suffix': 'ms', 'x-hot': true },
+      [`${k}.imageCacheMaxBytes`]: { type: 'integer', title: cacheLabels[1], minimum: 0, maximum: 1024 * 1024 * 1024, 'x-hot': true },
       [`${k}.autoFallback`]: { type: 'boolean', title: labels[0], 'x-hot': true },
       [`${k}.proactiveIntervalMs`]: { type: 'integer', title: labels[1], minimum: 0, maximum: 60000, 'x-suffix': 'ms', 'x-hot': true },
       [`${k}.streamIntervalMs`]: { type: 'integer', title: labels[2], minimum: 0, maximum: 5000, 'x-suffix': 'ms', 'x-hot': true },

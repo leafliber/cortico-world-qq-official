@@ -30,8 +30,12 @@ export function json(res: ServerResponse, body: unknown, status = 200): void {
 }
 
 export class TestHost implements WorldHost {
-  readonly dataDir = mkdtempSync(join(tmpdir(), 'qqofficial-events-'));
-  readonly store = new JsonlEventStore({ dataDir: this.dataDir, run: '20261024-000000', timezone: 'UTC' });
+  readonly dataDir: string;
+  readonly store: JsonlEventStore;
+  constructor(dataDir = mkdtempSync(join(tmpdir(), 'qqofficial-events-')), run = '20261024-000000') {
+    this.dataDir = dataDir;
+    this.store = new JsonlEventStore({ dataDir, run, timezone: 'UTC' });
+  }
   readonly log = nullLogger();
   readonly pushes: Array<{ event: EventEnvelope; options?: PushOptions }> = [];
   readonly blobs = new Map<string, { bytes: Uint8Array; mime: string }>();

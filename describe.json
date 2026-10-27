@@ -316,7 +316,7 @@
     },
     {
       "name": "qqofficial_history",
-      "description": "查询本 World 的事件历史，可按会话和游标筛选。",
+      "description": "查询本 World 的事件历史，可按会话和游标筛选。messagesOnly=true 只返回入站消息；meta.attachmentRefs 列出已补全的稳定 attachmentId、索引及临时图片缓存状态。",
       "parameters": {
         "type": "object",
         "properties": {
@@ -343,6 +343,9 @@
               }
             }
           },
+          "messagesOnly": {
+            "type": "boolean"
+          },
           "beforeCursor": {
             "type": "integer",
             "minimum": 1
@@ -366,10 +369,14 @@
     },
     {
       "name": "qqofficial_read_attachment",
-      "description": "读取已保存的 QQ 附件；cursor 来自历史，index 是 attachments 中从 0 开始的序号。可用 quotedIndex 选择 data.msg_elements 中的引用消息。只读取 QQ CDN，语音转为 WAV。",
+      "description": "读取 QQ 附件：单独传 attachmentId（优先），或同时传消息 cursor、index。引用可加 quotedIndex，嵌套引用用 quotedPath，二者互斥。图片优先读临时缓存，其他情况只下载 QQ CDN；语音转为 WAV。失败返回 code 和可用附件定位信息。",
       "parameters": {
         "type": "object",
         "properties": {
+          "attachmentId": {
+            "type": "string",
+            "pattern": "^qqa:[a-f0-9]{40}$"
+          },
           "cursor": {
             "type": "integer",
             "minimum": 1
@@ -382,20 +389,39 @@
             "type": "integer",
             "minimum": 0,
             "maximum": 100
+          },
+          "quotedPath": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 100
+            }
           }
         },
-        "required": [
-          "cursor",
-          "index"
-        ],
-        "additionalProperties": false
+        "required": [],
+        "additionalProperties": false,
+        "anyOf": [
+          {
+            "required": [
+              "attachmentId"
+            ]
+          },
+          {
+            "required": [
+              "cursor",
+              "index"
+            ]
+          }
+        ]
       },
       "tags": [
         "read"
       ],
       "summary": {
-        "zh": "读取已保存消息的 QQ CDN 附件。",
-        "en": "Reads QQ CDN attachments from stored messages."
+        "zh": "按持久引用或消息游标读取附件，优先使用临时图片缓存。",
+        "en": "Reads attachments by durable reference or message cursor, preferring cached images."
       }
     },
     {
@@ -497,6 +523,13 @@
       "description": {
         "zh": "平台接受互动确认的存档回执，不唤醒模型。",
         "en": "An archived interaction acknowledgement; does not wake the model."
+      }
+    },
+    {
+      "type": "qqofficial.attachments",
+      "description": {
+        "zh": "重复消息的附件补充记录，只归档，不重复唤醒模型。",
+        "en": "An archived attachment supplement for a duplicate message; does not wake the model."
       }
     }
   ],

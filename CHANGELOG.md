@@ -2,6 +2,13 @@
 
 # Changelog
 
+## Unreleased
+
+- Enrich duplicate messages through durable, archive-only attachment supplements without replacing original events, shifting existing attachment indices or delivering the same message again.
+- Add stable AppID/conversation/message attachment references, enriched history, nested quote paths and structured locator/download errors; keep cursor/index reads compatible.
+- Prefetch raster images into a bounded disk cache (24 hours / 256 MiB by default) and restore references and cached bytes across process restarts. Missing, expired or damaged cache entries fall back to QQ CDN downloads.
+- Cover sparse/richer duplicates, 27 repeated deliveries, delayed reads, nested quotes, failed supplement writes, account isolation, cache expiry/capacity/corruption and cancelled reads. Issue #1 remains open for validation against the reported deployment and Core/Persona handoff behavior.
+
 ## 0.2.3
 
 - Close model-directed local filesystem access: media now accepts host-managed `log:` / `mem:` attachments or public HTTP(S) URLs. Legacy `path` inputs are rejected and must migrate to `blob` or `url`.
