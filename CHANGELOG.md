@@ -2,6 +2,14 @@
 
 # Changelog
 
+## Unreleased
+
+- Enrich duplicate messages through durable attachment supplements without replacing original events or shifting existing attachment indices. New references piggyback on the next normal wakeup; URL-only refreshes remain archive-only.
+- Add stable AppID/conversation/message attachment references, enriched history, nested quote paths and structured locator/download errors; keep cursor/index reads compatible.
+- Prefetch raster images into a bounded disk cache (24 hours / 256 MiB by default, up to 10,000 images) and restore references and cached bytes across process restarts. Missing, expired or damaged cache entries fall back to QQ CDN downloads. Skip unchanged index writes and preserve files when an oversized old index cannot be loaded.
+- Keep tool schemas free of top-level combinators, classify download failures with typed errors, isolate shared downloads from a reader's cancellation, and omit empty reference lists and generated sparse quote slots from history.
+- Cover sparse/richer duplicates, 27 repeated deliveries, delayed reads, nested quotes, failed supplement writes, account isolation, WakeBus piggyback delivery, cache limits/corruption and cancellation in both sharing directions. Issue #1 remains open for real QQ identity/redelivery and Core/Persona handoff validation. Bounding the archive-backed message index remains follow-up work.
+
 ## 0.2.3
 
 - Close model-directed local filesystem access: media now accepts host-managed `log:` / `mem:` attachments or public HTTP(S) URLs. Legacy `path` inputs are rejected and must migrate to `blob` or `url`.

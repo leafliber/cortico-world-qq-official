@@ -85,7 +85,9 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 | `channel` | `channel_id` |
 | `dms` | 该频道私信的私有 `guild_id` |
 
-消息按平台事件类型、目标和消息 ID 去重；其他事件有事件 ID 时按事件 ID 去重。内存最多保留一万条去重标识，启动时从最近一万条 World 存档事件恢复。WebSocket 在当前 World 实例内重连时使用最后已保存的序号恢复；进程重启后创建新的网关会话。
+消息按 AppID、目标和消息 ID 去重，启动时从 World 存档重建消息与附件索引。频道中同一消息的 `AT_MESSAGE_CREATE` 与 `MESSAGE_CREATE` 会有意合并，保留先到的 eventType。同一消息后到的附件会通过 `qqofficial.attachments` 补充记录持久保存，保留原 cursor、已有附件与附件序号。新增 attachmentId 时，用 `trigger: piggyback` 将精简引用摘要入队：不单独唤醒 Persona、不刷新批处理计时器，随下一批正常唤醒一起投递；只有 URL/rkey 刷新时仍仅归档。补充记录保存失败时，Webhook 返回 503 供重试。其他事件有事件 ID 时按事件类型与事件 ID 去重，最多保留一万条近期标识。WebSocket 在当前 World 实例内重连时使用最后已保存的序号恢复；进程重启后创建新的网关会话。
+
+消息与附件索引目前仍在内存保留全量存档，包括没有附件的消息；内存占用和启动工作量会随历史增长。限制近期消息索引并按需查询旧存档属于后续工作，暂不直接淘汰索引，以免旧附件引用失效。
 
 发送序号预留 `qqofficial.attempt` 以及平台回执 `qqofficial.sent`、`qqofficial.removed`、`qqofficial.acknowledged` 均以 `deliver: false` 存档，因此不会再次唤醒 Persona。发送记录包含请求和平台响应；平台接受请求不代表收件人已读。HTTP 401 会触发一次刷新凭证后的重试。明确的限流最多重试两次，单次等待不超过五秒。自动降级仅处理明确拒绝：回复依据过期后改为主动发送、Markdown 权限不足后改为纯文本。内容审核拒绝、权限或额度不足不会被绕过。超时、HTTP 5xx 或响应缺少消息 ID 时保留“发送结果未知”，不自动重发。
 
@@ -98,8 +100,8 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 | `qqofficial_stream_message` | `followModel=true` 将下一轮模型公开正文发送到选定目标；也支持手动 C2C 分片。 |
 | `qqofficial_delete_message` | 撤回指定目标中机器人发送的消息。 |
 | `qqofficial_list_targets` | 列出当前 AppID 的已知会话、近期回复依据和主动接收状态。 |
-| `qqofficial_history` | 查询当前 AppID 的 World 存档，可按目标和游标筛选。 |
-| `qqofficial_read_attachment` | 按事件游标、附件序号读取内容；`quotedIndex` 可选择引用消息，语音转换为 WAV 后交给 Core。 |
+| `qqofficial_history` | 查询当前 AppID 的 World 存档；`messagesOnly=true` 只看入站消息，`meta.attachmentRefs` 列出补全后的附件引用和缓存状态。 |
+| `qqofficial_read_attachment` | 优先按 `attachmentId` 读取，也兼容消息 `cursor` + `index`；引用用 `quotedIndex` 或嵌套 `quotedPath`，语音转为 WAV。 |
 | `qqofficial_ack_interaction` | 使用 0 至 5 的结果码明确确认平台互动事件。 |
 
 回复消息使用 `replyTo`，回复事件使用 `eventId`，两者互斥。`delivery` 支持 `reply`、`proactive`、`auto`、`wakeup`：`auto` 在保守的近期窗口和已使用序号范围内选取回复依据，否则主动发送；`wakeup` 仅用于 QQ 单聊，由 QQ 判定唤醒权限。省略 `delivery` 和回复依据时仍为主动发送。已知主动接收关闭或已删除机器人的目标会被本地拒绝，普通被动回复不受这一检查限制。目标状态、发送序号从当前账号的事件存档恢复。
@@ -109,6 +111,16 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 `followModel=true` 必须明确选择目标；下一轮只转发公开正文，不包含推理和工具参数。带回复依据的 C2C 按间隔发送，主动通知、群、频道和频道私信缓冲后发普通消息；流式接口明确返回 404/405 时也缓冲降级。轮次结束、调用其他工具、取消、切换会话或空闲超时会结束流。手动 C2C 分片使用 `content`，续片沿用返回的 `streamId`，`finish` 默认为 true，目标、格式、回复依据和序号保持不变。已发送内容不会因后续失败而整段重发；结果未知的续片会在进程重启后继续禁止重放。
 
 附件读取只接受 `qq.com`、`qq.com.cn`、`qpic.cn`、`ugcimg.cn` 及其子域的 HTTPS 地址，每次重定向重新校验，下载请求不携带机器人认证头。Core 按当前模型能力决定是否传递对应 MIME 类型；仅有 URL 和元数据不会被视为已经看见或听见附件。
+
+附件定位优先使用事件或 `qqofficial_history` 的 `meta.attachmentRefs` 中的 `attachmentId`（`qqa:` 开头），读取时单独传入该字段。引用绑定当前 AppID、会话和消息，在事件存档保留期间可跨重启使用。也可继续传入消息的 `cursor` 和从 0 开始的 `index`：`quotedIndex=0` 选择 `msg_elements[0]`，`quotedPath=[0,1]` 选择 `msg_elements[0].msg_elements[1]`；二者互斥。历史中的发送回执和通知不是可读取附件的消息，可用 `messagesOnly=true` 排除。history 返回补全后的附件视图，原始存档事件保持不变；附件补充记录不单独出现在该工具结果中，没有附件的消息省略 `attachmentRefs`。
+
+收到图片元数据后会后台预取 PNG、JPEG、GIF、WebP、BMP 图片到部署的 `dataDir/qqofficial/image-cache/`，不阻塞事件保存和 Webhook 确认。默认保留 24 小时、整个部署最多 256 MiB，并限制为 10,000 张图片，单图不超过 `maxMediaBytes` 与 30 MiB 的较小值；最多两个预取并发、256 个待处理项。缓存按最早保存时间淘汰，启动、访问和运行期间每分钟清理过期数据，无变化时不重写索引。已有索引超过 4 MiB 读取上限时，本次运行停用缓存并保留磁盘文件。设 `imageCacheTtlMs=0` 或 `imageCacheMaxBytes=0` 可关闭。缓存不会自动投递原图到模型，仍需调用读取工具；支持图片的模型才能看到其内容。引用与缓存都支持重启恢复，读取优先用缓存，缓存失效或损坏后重新下载。后台预取失败不丢弃消息或附件定位信息。取消一次读取不会使共享下载的其他读取或预取失败，未取消的调用方会重新发起下载。
+
+交接摘要可保留 `attachmentId`，需要时重新读取图片。临时缓存过期且 QQ URL 已失效时，仍需用户重新上传。工具读取成功后产生的 Core `log:` 附件由宿主自己的附件保留策略管理，不受此预取缓存的 TTL 控制。本扩展不修改 Core/Persona 的上下文压缩策略。
+
+[Issue #1](https://github.com/leafliber/cortico-world-qq-official/issues/1) 继续保留实测验收，其中包括 QQ 重复投递时附件 ID 或 URL 中的 `fileid` 是否稳定。URL 身份判定忽略会轮换的 `rkey`，保留 `fileid` 等内容选择参数；若附件身份和内容选择参数都变化，同一图片可能新增一个引用。此时保留两个候选，不覆盖已有图片。
+
+读取失败返回结构化 `code`、`message`，并在适用时返回 `available` 附件列表或 `httpStatus`。可据此区分 `MESSAGE_CURSOR_NOT_FOUND`、`MESSAGE_EVENT_TYPE_MISMATCH`、`MESSAGE_ACCOUNT_MISMATCH`、`ATTACHMENT_REFERENCE_NOT_FOUND`、`QUOTED_MESSAGE_NOT_FOUND`、`ATTACHMENT_INDEX_NOT_FOUND` 与 `ATTACHMENT_DOWNLOAD_FAILED`，避免把定位错误误当作链接过期。
 
 频道和频道私信支持文本、Markdown、远程图片及宿主附件图片的 multipart 上传，C2C 与群聊支持图片、语音、视频和文件。上传读取和附件下载默认上限为 100 MiB；发送还受图片 30 MiB、语音 20 MiB、视频和文件 100 MiB 的本地上限约束，QQ 可另行收紧。5 MiB 起使用平台分块上传协议，校验完整分块计划、逐块确认后合并，并按平台 TTL 缓存文件句柄。批量发送遇错即停止，返回已成功项与失败位置，避免整批重发。
 
@@ -136,6 +148,8 @@ AppID 保存到 `worlds.qqofficial.appId`；AppSecret 通过 `WorldContext.store
 | `timeoutMs` | `20000` | 网络请求超时毫秒数，重启后生效。 |
 | `reconnectMs`、`maxReconnectMs` | `1000`、`30000` | 网关重连退避的毫秒数范围，重启后生效。 |
 | `maxMediaBytes` | `104857600` | 附件读取上限；上传还受媒体类型限制，立即生效。 |
+| `imageCacheTtlMs` | `86400000` | 图片临时缓存保留毫秒数，0 关闭，最长 30 天；立即生效。 |
+| `imageCacheMaxBytes` | `268435456` | 图片临时缓存总字节上限，0 关闭，最大 1 GiB；立即生效。 |
 | `autoFallback` | `true` | 明确拒绝后自动降级；单次工具可用 `fallback=false` 禁用。 |
 | `proactiveIntervalMs` | `3000` | 主动消息最小间隔。 |
 | `streamIntervalMs` | `500` | 流式分片最小间隔。 |

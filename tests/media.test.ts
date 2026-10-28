@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from 'vitest';
-import { readAttachment } from '../src/media.ts';
+import { AttachmentDownloadError, readAttachment } from '../src/media.ts';
 import { httpServer } from './helpers.ts';
 import { publicAddress, publicMedia, mediaBlobHandle } from '../src/media-source.ts';
 
@@ -14,7 +14,11 @@ describe('attachment transport', () => {
   });
   it('rejects private, credential-bearing and deceptive hosts before making a request', async () => {
     const urls = ['http://qpic.cn/a', 'https://127.0.0.1/a', 'https://qpic.cn.example.invalid/a', 'https://user:password@qpic.cn/a', 'https://qpic.cn:8080/a'];
-    for (const url of urls) await expect(readAttachment(url, options())).rejects.toThrow('outside');
+    for (const url of [...urls, 'not a URL']) {
+      const result = readAttachment(url, options());
+      await expect(result).rejects.toBeInstanceOf(AttachmentDownloadError);
+      await expect(result).rejects.toMatchObject({ code: 'URL_REJECTED' });
+    }
   });
 
   it('follows CDN redirects and refuses redirects to a private host', async () => {
@@ -23,7 +27,7 @@ describe('attachment transport', () => {
       else { res.writeHead(302, { Location: req.url === '/safe' ? 'https://qpic.cn/image' : 'https://127.0.0.1/private' }); res.end(); }
     });
     expect(await readAttachment('https://qpic.cn/safe', options())).toEqual({ bytes: Buffer.from('image'), mime: 'image/png' });
-    await expect(readAttachment('https://qpic.cn/unsafe', options())).rejects.toThrow('outside');
+    await expect(readAttachment('https://qpic.cn/unsafe', options())).rejects.toMatchObject({ code: 'URL_REJECTED' });
   });
 
   it('enforces size limits for declared and chunked bodies and bounds redirect loops', async () => {
@@ -32,8 +36,22 @@ describe('attachment transport', () => {
       else if (req.url === '/declared') { res.writeHead(200, { 'Content-Length': '9' }); res.end('123456789'); }
       else { res.writeHead(200); res.write('12345'); res.end('6789'); }
     });
-    for (const path of ['/declared', '/chunked']) await expect(readAttachment(`https://qpic.cn${path}`, options())).rejects.toThrow('maxMediaBytes');
-    await expect(readAttachment('https://qpic.cn/loop', options())).rejects.toThrow('Too many');
+    for (const path of ['/declared', '/chunked']) await expect(readAttachment(`https://qpic.cn${path}`, options())).rejects.toMatchObject({ code: 'TOO_LARGE' });
+    await expect(readAttachment('https://qpic.cn/loop', options())).rejects.toMatchObject({ code: 'REDIRECT_ERROR' });
+  });
+
+  it('returns typed HTTP, malformed redirect and empty-response errors', async () => {
+    server = await httpServer((req, res) => {
+      if (req.url === '/expired') res.writeHead(403);
+      else if (req.url === '/empty') res.writeHead(204);
+      else if (req.url === '/bad-location') res.writeHead(302, { Location: 'http://[' });
+      else res.writeHead(302);
+      res.end();
+    });
+    await expect(readAttachment('https://qpic.cn/expired', options())).rejects.toMatchObject({ code: 'HTTP_ERROR', httpStatus: 403 });
+    await expect(readAttachment('https://qpic.cn/empty', options())).rejects.toMatchObject({ code: 'EMPTY_RESPONSE' });
+    await expect(readAttachment('https://qpic.cn/bad-location', options())).rejects.toMatchObject({ code: 'URL_REJECTED' });
+    await expect(readAttachment('https://qpic.cn/no-location', options())).rejects.toMatchObject({ code: 'REDIRECT_ERROR' });
   });
 });
 

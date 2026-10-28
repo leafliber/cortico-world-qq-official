@@ -1,7 +1,7 @@
 import { fileURLToPath } from 'node:url';
 import { basename } from 'node:path';
 import type { Language } from 'cortico/core/language.ts';
-import type { EventEnvelope, OutputTap, ToolDef, ToolOutcome, World, WorldWebUiDecl, WorldHost } from 'cortico/core/types.ts';
+import type { EventEnvelope, OutputTap, ToolDef, ToolOutcome, TriggerMode, World, WorldWebUiDecl, WorldHost } from 'cortico/core/types.ts';
 import { nowIso } from 'cortico/core/util.ts';
 import type { WorldContext } from 'cortico/world.ts';
 import { coerceGroupValues, getByPath, setByPath } from 'cortico/core/config-schema.ts';
@@ -10,7 +10,7 @@ import { QQOfficialApiError, QQOfficialClient, QQOFFICIAL_SANDBOX_URL } from './
 import { QQOFFICIAL_ID, QQOFFICIAL_SECRET, qqOfficialConfigGroup, validateConfig, type QQOfficialConfigSection } from './config.ts';
 import { QQOfficialGateway, type QQOfficialConnectionState } from './gateway.ts';
 import { QQOFFICIAL_MODEL_TEXT, type ModelLanguage } from './model-text.ts';
-import { readAttachment } from './media.ts';
+import { AttachmentDownloadError, readAttachment } from './media.ts';
 import { normalize } from './normalize.ts';
 import { integer, object, remoteUrl, route, string, target, targetKey, type JsonObject, type QQOfficialDispatch, type QQOfficialTarget } from './protocol.ts';
 import { qqOfficialText } from './strings.ts';
@@ -22,9 +22,22 @@ import { QQUploader, MEDIA_LIMITS } from './upload.ts';
 import { QQSessionState } from './session-state.ts';
 import { sendWithFallback, waitUntil } from './delivery.ts';
 import { QQReplyStream } from './reply-stream.ts';
+import { ATTACHMENT_ID, AttachmentError, AttachmentIndex, attachmentSummary, type AttachmentEntry, type AttachmentMessage } from './attachments.ts';
+import { ImageCache, imageMime } from './image-cache.ts';
 
 interface StreamState {
   target: QQOfficialTarget; streamId: string; format: string; anchors: JsonObject; sequence: number; index: number; at: number; uncertain?: boolean;
+}
+interface DownloadedAttachment { bytes: Buffer; mime: string; source: 'cache' | 'remote'; }
+
+/** A cancelled tool stops waiting immediately, even when a background download owns the request. */
+function awaitAttachment(task: Promise<DownloadedAttachment>, signal: AbortSignal): Promise<DownloadedAttachment> {
+  signal.throwIfAborted();
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(signal.reason);
+    signal.addEventListener('abort', abort, { once: true });
+    void task.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
 }
 
 export interface QQOfficialWorldOptions {
@@ -60,6 +73,12 @@ export class QQOfficialWorld implements World {
   private modelRoundOpen = false;
   private replyWaitForRound = false;
   private lastProactiveAt = 0;
+  private attachments = new AttachmentIndex('');
+  private imageCache?: ImageCache;
+  private imageCacheTimer?: ReturnType<typeof setInterval>;
+  private imageQueue = new Map<string, AttachmentEntry>();
+  private imageWorkers = new Set<Promise<void>>();
+  private attachmentDownloads = new Map<string, { promise: Promise<DownloadedAttachment>; prefetch: boolean; url: unknown; signal: AbortSignal }>();
 
   constructor(private readonly options: QQOfficialWorldOptions) {
     this.binding = new QQOfficialBinding(options.context.cfg.timeoutMs, options.endpoints?.bindingUrl);
@@ -128,6 +147,20 @@ export class QQOfficialWorld implements World {
     this.host = host;
     this.abort = new AbortController();
     const saved = host.store.range({ source: this.id });
+    this.attachments = new AttachmentIndex(this.appId);
+    for (const event of saved) this.attachments.observe(event);
+    this.imageCache = new ImageCache(this.options.context.dataDir, () => ({
+      ttlMs: this.cfg.imageCacheTtlMs, maxBytes: this.cfg.imageCacheMaxBytes,
+      maxFileBytes: Math.min(this.cfg.maxMediaBytes, 30 * 1024 * 1024),
+    }));
+    try { await this.imageCache.init(); }
+    catch { host.log.warn('qqofficial.image_cache_unavailable'); this.imageCache = undefined; }
+    if (this.imageCache && this.options.context.dataDir) {
+      this.imageCacheTimer = setInterval(() => {
+        void this.imageCache?.prune().catch(() => host.log.warn('qqofficial.image_cache_cleanup_failed'));
+      }, 60000);
+      this.imageCacheTimer.unref();
+    }
     this.sessions = new QQSessionState(); this.streams.clear(); this.lastProactiveAt = 0;
     for (const event of saved) {
       if (event.meta?.appId !== this.appId) continue;
@@ -184,9 +217,14 @@ export class QQOfficialWorld implements World {
     this.modelRoundOpen = false; this.replyWaitForRound = false;
     for (const timer of this.streamTimers.values()) clearTimeout(timer);
     this.streamTimers.clear();
+    clearInterval(this.imageCacheTimer); this.imageCacheTimer = undefined;
+    this.imageQueue.clear();
     this.abort.abort();
     await Promise.allSettled([this.gateway?.stop(), this.webhook?.stop()]);
     await Promise.allSettled([this.incoming, this.outgoing]);
+    await Promise.allSettled([...this.imageWorkers, ...[...this.attachmentDownloads.values()].map(d => d.promise)]);
+    await this.imageCache?.flush();
+    this.imageCache = undefined;
     this.gateway = null; this.webhook = null; this.client = null; this.uploader = null; this.host = null;
     this.binding.clear(); this.setState('offline');
   }
@@ -201,9 +239,32 @@ export class QQOfficialWorld implements World {
     const task = this.incoming.then(async () => {
       this.abort.signal.throwIfAborted();
       const incoming = normalize(event);
+      if (incoming.kind === 'message') {
+        const previous = this.attachments.find(incoming.target!, incoming.messageId!);
+        if (previous) {
+          const entries = this.attachments.merge(previous.target, previous.messageId, incoming.data, previous.entries);
+          if (JSON.stringify(entries) !== JSON.stringify(previous.entries)) {
+            const known = new Set(previous.entries.map(entry => entry.attachmentId));
+            const added = entries.filter(entry => !known.has(entry.attachmentId));
+            // Commit before updating the in-memory union, so a failed append can be retried.
+            // Only new references ride the next wakeup; full descriptors remain in archive metadata.
+            const supplement = await this.push('attachments', previous.target, {
+              messageCursor: previous.cursor, messageId: previous.messageId,
+              attachmentRefs: added.map(entry => attachmentSummary(entry, previous.cursor)),
+            }, added.length > 0, { entries }, 'piggyback');
+            this.attachments.observe(supplement);
+          }
+          this.prefetchImages(previous.entries);
+          return;
+        }
+      }
       if (incoming.key && this.seen.has(incoming.key)) return;
       const { key, ...data } = incoming;
-      await this.push(incoming.kind, incoming.target, data, true, key ? { dedupKey: key } : {});
+      const entries = incoming.kind === 'message' ? this.attachments.merge(incoming.target!, incoming.messageId!, incoming.data) : [];
+      const saved = await this.push(incoming.kind, incoming.target,
+        { ...data, ...(entries.length ? { attachmentRefs: entries.map(e => attachmentSummary(e)) } : {}) }, true, key ? { dedupKey: key } : {});
+      this.attachments.observe(saved);
+      this.prefetchImages(entries);
       if (key) {
         this.seen.add(key);
         if (this.seen.size > 10000) this.seen.delete(this.seen.values().next().value!);
@@ -215,17 +276,126 @@ export class QQOfficialWorld implements World {
 
   private sender(value?: QQOfficialTarget): string { return value ? `${this.id}.${targetKey(value)}` : this.id; }
 
-  private async push(kind: 'message' | 'notice' | 'sent' | 'attempt' | 'removed' | 'acknowledged', destination: QQOfficialTarget | undefined,
-    data: JsonObject, deliver = false, extra: JsonObject = {}): Promise<EventEnvelope> {
+  private async push(kind: 'message' | 'notice' | 'sent' | 'attempt' | 'removed' | 'acknowledged' | 'attachments', destination: QQOfficialTarget | undefined,
+    data: JsonObject, deliver = false, extra: JsonObject = {}, trigger: TriggerMode = 'debounce'): Promise<EventEnvelope> {
     if (!this.host) throw new Error('World is not running');
     const event = await this.host.pushEvent({
       type: `${this.id}.${kind}`, source: this.id, origin: 'external', ts: nowIso(this.options.context.timezone),
       senderKey: this.sender(destination), ...(kind === 'sent' ? { tags: ['speak'] as const } : {}),
       text: `${this.text[kind]}\n${JSON.stringify(data)}`,
       meta: { ...data, ...extra, target: destination, appId: this.appId },
-    }, { deliver, trigger: 'debounce' });
+    }, { deliver, trigger });
     this.sessions.observe(event);
     return event;
+  }
+
+  private prefetchImages(entries: AttachmentEntry[]): void {
+    if (!this.imageCache?.enabled || this.abort.signal.aborted) return;
+    for (const entry of entries) {
+      const a = entry.attachment;
+      if (typeof a.url !== 'string' || !(/^image\/(png|jpeg|gif|webp|bmp)(;|$)/i.test(String(a.content_type)) || /\.(png|jpe?g|gif|webp|bmp)$/i.test(String(a.filename ?? '')))) continue;
+      if (this.imageCache.status(entry.attachmentId).cacheStatus === 'cached' || this.imageQueue.has(entry.attachmentId)) continue;
+      if (this.imageQueue.size >= 256) { this.host?.log.warn('qqofficial.image_cache_queue_full'); break; }
+      this.imageQueue.set(entry.attachmentId, entry);
+    }
+    while (this.imageWorkers.size < 2 && this.imageQueue.size) {
+      const worker = (async () => {
+        while (this.imageQueue.size && !this.abort.signal.aborted) {
+          const [id, entry] = this.imageQueue.entries().next().value!;
+          this.imageQueue.delete(id);
+          try { await this.downloadAttachment(entry, this.abort.signal, true); }
+          catch (error) {
+            if (!this.abort.signal.aborted) this.host?.log.warn('qqofficial.image_prefetch_failed', {
+              attachmentId: id, code: error instanceof AttachmentError ? error.code : 'ATTACHMENT_FETCH_FAILED',
+            });
+          }
+        }
+      })();
+      this.imageWorkers.add(worker);
+      void worker.finally(() => this.imageWorkers.delete(worker));
+    }
+  }
+
+  private downloadAttachment(entry: AttachmentEntry, signal: AbortSignal, prefetch = false): Promise<DownloadedAttachment> {
+    const active = this.attachmentDownloads.get(entry.attachmentId);
+    if (active) return active.promise.catch(error => {
+      const refreshed = active.url !== entry.attachment.url;
+      const largerRead = !prefetch && active.prefetch && error instanceof AttachmentError && error.code === 'ATTACHMENT_TOO_LARGE';
+      const ownerCancelled = active.signal.aborted && !signal.aborted;
+      if (!signal.aborted && (refreshed || largerRead || ownerCancelled)) return this.downloadAttachment(entry, signal, prefetch);
+      throw error;
+    });
+    const task = (async () => {
+      signal.throwIfAborted();
+      try {
+        const cached = await this.imageCache?.get(entry.attachmentId);
+        if (cached) return { ...cached, source: 'cache' as const };
+      } catch { this.host?.log.warn('qqofficial.image_cache_read_failed', { attachmentId: entry.attachmentId }); }
+      const url = entry.attachment.url;
+      if (typeof url !== 'string' || !url) throw new AttachmentError('ATTACHMENT_URL_MISSING', 'Attachment metadata has no download URL; inspect history or ask for the image again.', attachmentSummary(entry));
+      let media: Awaited<ReturnType<typeof readAttachment>>;
+      try {
+        media = await readAttachment(url, {
+          maxBytes: Math.min(this.cfg.maxMediaBytes, prefetch ? 30 * 1024 * 1024 : Infinity),
+          timeoutMs: this.cfg.timeoutMs, signal, testOrigin: this.options.endpoints?.mediaOrigin,
+        });
+      } catch (error) {
+        signal.throwIfAborted();
+        const failure = error instanceof AttachmentDownloadError ? error : undefined;
+        const status = failure?.httpStatus;
+        const code = failure?.code === 'URL_REJECTED' ? 'ATTACHMENT_URL_REJECTED' : failure?.code === 'TOO_LARGE' ? 'ATTACHMENT_TOO_LARGE' : 'ATTACHMENT_DOWNLOAD_FAILED';
+        throw new AttachmentError(code, status ? `Attachment download returned HTTP ${status}; the cached image is unavailable. Ask for a new upload if the URL has expired.`
+          : code === 'ATTACHMENT_URL_REJECTED' ? 'Attachment URL is outside the permitted QQ CDN URLs.'
+          : code === 'ATTACHMENT_TOO_LARGE' ? 'Attachment exceeds the configured download limit.' : 'Attachment download failed or timed out; retry the same attachmentId.',
+        { ...attachmentSummary(entry), cacheStatus: 'remote', ...(status ? { httpStatus: status } : {}) });
+      }
+      const mime = imageMime(media.bytes);
+      if (mime) {
+        media.mime = mime;
+        signal.throwIfAborted();
+        try { await this.imageCache?.put(entry.attachmentId, media.bytes, mime); }
+        catch { this.host?.log.warn('qqofficial.image_cache_write_failed', { attachmentId: entry.attachmentId }); }
+      }
+      return { ...media, source: 'remote' as const };
+    })();
+    this.attachmentDownloads.set(entry.attachmentId, { promise: task, prefetch, url: entry.attachment.url, signal });
+    void task.finally(() => {
+      if (this.attachmentDownloads.get(entry.attachmentId)?.promise === task) this.attachmentDownloads.delete(entry.attachmentId);
+    }).catch(() => undefined);
+    return task;
+  }
+
+  private locateAttachment(args: JsonObject): { message: AttachmentMessage; entry: AttachmentEntry } {
+    if (args.attachmentId !== undefined) {
+      if (typeof args.attachmentId !== 'string' || !ATTACHMENT_ID.test(args.attachmentId)
+        || ['cursor', 'index', 'quotedIndex', 'quotedPath'].some(key => args[key] !== undefined)) {
+        throw new AttachmentError('ATTACHMENT_LOCATOR_INVALID', 'Supply attachmentId alone, or cursor and index with an optional quotedIndex/quotedPath.');
+      }
+      const found = this.attachments.ref(args.attachmentId);
+      if (!found) throw new AttachmentError('ATTACHMENT_REFERENCE_NOT_FOUND', 'Attachment reference not found for this AppID. Query qqofficial_history with messagesOnly=true for current references.', { attachmentId: args.attachmentId });
+      return found;
+    }
+    if (args.cursor === undefined || args.index === undefined) throw new AttachmentError('ATTACHMENT_LOCATOR_INVALID', 'Supply attachmentId, or both cursor and zero-based index from qqofficial_history.');
+    const cursor = integer(args.cursor, 'cursor', 1, Number.MAX_SAFE_INTEGER);
+    const index = integer(args.index, 'index', 0, Number.MAX_SAFE_INTEGER);
+    const event = this.host!.store.get(cursor);
+    if (!event) throw new AttachmentError('MESSAGE_CURSOR_NOT_FOUND', 'Message event not found at this cursor. Query qqofficial_history with messagesOnly=true.', { cursor });
+    if (event.source !== this.id) throw new AttachmentError('MESSAGE_SOURCE_MISMATCH', 'This cursor belongs to a different World.', { cursor });
+    if (event.meta?.appId !== this.appId) throw new AttachmentError('MESSAGE_ACCOUNT_MISMATCH', 'This cursor belongs to a different QQ AppID.', { cursor });
+    if (event.type !== `${this.id}.message`) throw new AttachmentError('MESSAGE_EVENT_TYPE_MISMATCH', 'This cursor is not an incoming message. Use a qqofficial.message cursor from history.', { cursor, eventType: event.type });
+    if (args.quotedIndex !== undefined && args.quotedPath !== undefined) throw new AttachmentError('ATTACHMENT_LOCATOR_INVALID', 'quotedIndex and quotedPath are mutually exclusive.');
+    const path = args.quotedPath !== undefined ? args.quotedPath : args.quotedIndex !== undefined ? [args.quotedIndex] : [];
+    if (!Array.isArray(path) || path.length > 8 || path.some(i => !Number.isInteger(i) || i < 0 || i > 100)) throw new AttachmentError('ATTACHMENT_LOCATOR_INVALID', 'quotedPath must contain at most eight zero-based msg_elements indices (0–100).');
+    const message = this.attachments.at(cursor);
+    if (!message) throw new AttachmentError('MESSAGE_METADATA_UNAVAILABLE', 'This message has no usable saved attachment metadata. Query history or request a new upload.', { cursor });
+    let data = object(this.attachments.view(event).meta!.data);
+    for (const i of path) {
+      if (!Array.isArray(data.msg_elements) || !data.msg_elements[i]) throw new AttachmentError('QUOTED_MESSAGE_NOT_FOUND', 'Quoted message not found at this path.', { cursor, quotedPath: path, available: this.attachments.summaries(message) });
+      data = object(data.msg_elements[i]);
+    }
+    const entry = message.entries.find(e => e.index === index && e.quotedPath.join('.') === path.join('.'));
+    if (!entry) throw new AttachmentError('ATTACHMENT_INDEX_NOT_FOUND', 'Attachment not found at this index. Use an attachmentId from available or query history again.', { cursor, index, quotedPath: path, available: this.attachments.summaries(message) });
+    return { message, entry };
   }
 
   private anchors(args: JsonObject): JsonObject {
@@ -248,35 +418,34 @@ export class QQOfficialWorld implements World {
     combined.throwIfAborted();
     if (action === 'targets') return JSON.stringify(this.sessions.list(args.limit === undefined ? 30 : integer(args.limit, 'limit', 1, 100)));
     if (action === 'read') {
-      const cursor = integer(args.cursor, 'cursor', 1, Number.MAX_SAFE_INTEGER);
-      const index = integer(args.index, 'index', 0, Number.MAX_SAFE_INTEGER);
-      const event = this.host.store.get(cursor);
-      if (event?.type !== `${this.id}.message` || event.source !== this.id || event.meta?.appId !== this.appId) throw new Error('Message event not found');
-      let data = object(event.meta.data);
-      if (args.quotedIndex !== undefined) {
-        const quotedIndex = integer(args.quotedIndex, 'quotedIndex', 0, 100);
-        if (!Array.isArray(data.msg_elements) || quotedIndex >= data.msg_elements.length) throw new Error('Quoted message not found');
-        data = object(data.msg_elements[quotedIndex]);
-      }
-      const attachments = data.attachments;
-      if (!Array.isArray(attachments) || index >= attachments.length) throw new Error('Attachment not found');
-      const attachment = object(attachments[index]);
-      const media = await readAttachment(string(attachment.url, 'attachment.url'), {
-        maxBytes: this.cfg.maxMediaBytes, timeoutMs: this.cfg.timeoutMs, signal: combined, testOrigin: this.options.endpoints?.mediaOrigin,
-      });
+      const { message, entry } = this.locateAttachment(args);
+      const attachment = entry.attachment;
+      const media = { ...await awaitAttachment(this.downloadAttachment(entry, combined), combined) };
+      combined.throwIfAborted();
+      if (media.bytes.byteLength > this.cfg.maxMediaBytes) throw new AttachmentError('ATTACHMENT_TOO_LARGE', 'Attachment exceeds the current download limit.', attachmentSummary(entry, message.cursor));
       if (isSilk(media.bytes) || isAudio(String(attachment.content_type ?? media.mime), String(attachment.filename ?? ''))) {
         media.bytes = Buffer.from(await audioToWav(media.bytes, { signal: combined, timeoutMs: this.cfg.timeoutMs, ffmpegPath: this.cfg.ffmpegPath }));
         media.mime = 'audio/wav';
       }
-      const text = JSON.stringify({ cursor, index, messageId: event.meta.messageId, mime: media.mime, bytes: media.bytes.byteLength });
+      const text = JSON.stringify({ ...attachmentSummary(entry, message.cursor), messageId: message.messageId,
+        mime: media.mime, bytes: media.bytes.byteLength, source: media.source, ...(this.imageCache?.status(entry.attachmentId) ?? { cacheStatus: 'remote' }) });
       return { text, blobs: [{ ...media, ...(typeof attachment.filename === 'string' ? { name: media.mime === 'audio/wav' ? attachment.filename.replace(/\.[^.]*$/, '') + '.wav' : attachment.filename } : {}), fallbackText: text }] };
     }
     if (action === 'history') {
+      if (args.messagesOnly !== undefined && typeof args.messagesOnly !== 'boolean') throw new Error('messagesOnly must be a boolean');
       const limit = args.limit === undefined ? 30 : integer(args.limit, 'limit', 1, 100);
       const before = args.beforeCursor === undefined ? undefined : integer(args.beforeCursor, 'beforeCursor', 1, Number.MAX_SAFE_INTEGER) - 1;
       const destination = args.target === undefined ? undefined : target(args.target);
       const events = this.host.store.range({ source: this.id, ...(destination ? { senderKey: this.sender(destination) } : {}), toCursor: before });
-      return JSON.stringify(events.filter((e) => e.meta?.appId === this.appId && e.type !== `${this.id}.attempt`).slice(-limit));
+      return JSON.stringify(events.filter((e) => e.meta?.appId === this.appId && ![`${this.id}.attempt`, `${this.id}.attachments`].includes(e.type)
+        && (!args.messagesOnly || e.type === `${this.id}.message`)).slice(-limit).map(event => {
+        const view = this.attachments.view(event);
+        const message = this.attachments.at(event.cursor);
+        if (message?.entries.length) view.meta = { ...view.meta, attachmentRefs: message.entries.map(entry => ({
+          ...attachmentSummary(entry, message.cursor), ...(this.imageCache?.status(entry.attachmentId) ?? { cacheStatus: 'remote' }),
+        })) };
+        return view;
+      }));
     }
     if (action === 'interaction') {
       const id = string(args.interactionId, 'interactionId');

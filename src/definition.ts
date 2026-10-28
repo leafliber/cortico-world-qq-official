@@ -20,6 +20,7 @@ export function qqOfficialDefinition(options: Pick<QQOfficialWorldOptions, 'mode
         { type: 'qqofficial.attempt', description: QQOFFICIAL_EVENT_DESCRIPTIONS.attempt },
         { type: 'qqofficial.removed', description: QQOFFICIAL_EVENT_DESCRIPTIONS.removed },
         { type: 'qqofficial.acknowledged', description: QQOFFICIAL_EVENT_DESCRIPTIONS.acknowledged },
+        { type: 'qqofficial.attachments', trigger: 'piggyback', description: QQOFFICIAL_EVENT_DESCRIPTIONS.attachments },
       ],
     },
   };
